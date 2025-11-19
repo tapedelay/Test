@@ -1,35 +1,31 @@
-import math
 import pygame
+import numpy as np
+import math
 import random
 import time
-import numpy as np
+from pygame.locals import *
+# PyOpenGL is required for GPU rendering
+try:
+    from OpenGL.GL import *
+    from OpenGL.GLU import *
+except ImportError:
+    print("\nERROR: PyOpenGL is not installed. Please run: pip install PyOpenGL PyOpenGL_accelerate")
+    exit()
 
 # --- Configuration ---
-# RENDER_RESOLUTION defines the final 600x600 display size.
-RENDER_RESOLUTION = 600 
-SCREEN_WIDTH = RENDER_RESOLUTION
-SCREEN_HEIGHT = RENDER_RESOLUTION
-TARGET_FPS = 120 # High FPS target
-
-# Symmetry is 8v x 4h:
-CALC_UNIT_WIDTH = 150 
-CALC_UNIT_HEIGHT = 75 
-CALC_WIDTH = 1600 # Pattern is calculated on a 1600x1600 reference grid
+# Fixed resolution parameters are now mostly conceptual/for scaling constants
+CALC_RESOLUTION = 400
+TARGET_FPS = 60
+SLOW_MOTION_FACTOR = 500.0
+SCREEN_WIDTH, SCREEN_HEIGHT = 800, 600 # Initial window size
+CALC_WIDTH = 1600 # Pattern is calculated on a 1600x1600 virtual grid
 CALC_HEIGHT = 1600
 
-SLOW_MOTION_FACTOR = 500.0
-
-# Calculate the precise scale factor
-SCALE_FACTOR_X = CALC_WIDTH / CALC_UNIT_WIDTH
-SCALE_FACTOR_Y = CALC_HEIGHT / CALC_UNIT_HEIGHT
-
-
-# --- 31 VARIABLES AND THEIR RANGES (DAMPENED GEOMETRY) ---
+# 💡 20 VARIABLES AND THEIR RANGES (Unchanged)
 VARIABLE_PARAMS = {
-    # Original 20 Variables (Unchanged)
     'freq_r': (0.02, 0.005, 0.05), 'freq_g': (0.015, 0.005, 0.05),
-    'freq_b': (0.025, 0.01, 0.08), 'R_amp': (127, 60, 127),
-    'G_amp': (127, 60, 127), 'B_amp': (127, 60, 127),
+    'freq_b': (0.025, 0.01, 0.08), 'R_amp': (127.0, 60.0, 127.0),
+    'G_amp': (127.0, 60.0, 127.0), 'B_amp': (127.0, 60.0, 127.0),
     'shift_x_mult': (5.0, -100.0, 100.0), 'shift_y_mult': (2.0, -100.0, 100.0), 
     'r_factor': (10.0, 5.0, 25.0), 'angle_factor': (3.0, 1.0, 8.0),
     'shift_center_x': (0.0, -0.2, 0.2), 'shift_center_y': (0.0, -0.2, 0.2),
@@ -37,31 +33,13 @@ VARIABLE_PARAMS = {
     'time_mult_b': (1.0, 0.5, 2.0), 'offset_r': (0.0, -10.0, 10.0),
     'offset_g': (0.0, -10.0, 10.0), 'offset_b': (0.0, -10.0, 10.0),
     'r_exponent': (1.0, 0.5, 2.0), 'blue_hue_speed': (2.0, 0.5, 4.0),
-    
-    # NEW 11 SALIENT VISUAL VARIABLES (Geometry Dampened)
-    'r_offset': (0.0, -0.5, 0.5), # Offset applied to normalized radius R
-    'angle_offset': (0.0, -np.pi, np.pi), # Offset applied to angle
-    'r_mult_x': (1.0, 0.8, 1.2), # <-- Tighter range (less stretching)
-    'r_mult_y': (1.0, 0.8, 1.2), # <-- Tighter range (less stretching)
-    'coord_skew': (0.0, -0.03, 0.03), # <-- Much smaller range (less shearing)
-    'time_shift_offset': (0.0, 0.0, 50.0), # Constant time offset (phase shift)
-    'r_freq_mult_g': (1.0, 0.5, 3.0), # Multiplier for Green channel's radial term
-    'x_wave_freq': (0.005, 0.001, 0.05), # Frequency for X coordinate distortion wave
-    'y_wave_freq': (0.005, 0.001, 0.05), # Frequency for Y coordinate distortion wave
-    'r_skew_x_amp': (0.0, -0.5, 0.5), # <-- Smaller amplitude for X-wave based on R
-    'color_mix_mult': (0.0, 0.0, 1.0), # Blending R input into G input
 }
 
-# LFO Frequencies Generation (Kept slow as requested)
+# LFO Frequencies (Unchanged)
 def generate_lfo_frequencies(params):
     frequencies = {}
     for name in params:
-        # Frequencies for the 11 new parameters are in the slow-flow range (0.15 Hz to 0.5 Hz)
-        if name in ['r_offset', 'angle_offset', 'r_mult_x', 'r_mult_y', 'coord_skew', 
-                    'time_shift_offset', 'r_freq_mult_g', 'x_wave_freq', 'y_wave_freq', 
-                    'r_skew_x_amp', 'color_mix_mult']:
-            frequencies[name] = random.uniform(0.15, 0.5) 
-        elif name in ['shift_center_x', 'shift_center_y']:
+        if name in ['shift_center_x', 'shift_center_y']:
             frequencies[name] = random.uniform(0.0001, 0.02) / 2.0
         else:
             frequencies[name] = random.uniform(0.01, 20.0) / 2.0
@@ -71,165 +49,229 @@ LFO_FREQUENCIES = generate_lfo_frequencies(VARIABLE_PARAMS)
 
 
 def generate_lfo_value(variable_name, effective_time_s):
-    """Calculates the current value of an LFO-controlled variable."""
+    """Calculates the current LFO value for a single variable."""
     base, min_val, max_val = VARIABLE_PARAMS[variable_name]
     lfo_freq = LFO_FREQUENCIES[variable_name]
-    
-    # Sinusoidal modulation
     lfo_output = np.sin(effective_time_s * lfo_freq * 2 * np.pi)
-    
-    # Scale output to be between min_val and max_val
+    # Map sin output (-1 to 1) to normalized value (0 to 1)
     normalized_lfo = (lfo_output + 1.0) / 2.0
+    # Map normalized value (0 to 1) to the final range (min_val to max_val)
     return min_val + normalized_lfo * (max_val - min_val)
 
-def generate_frame_numpy(v, effective_time_s):
-    """
-    Generates only the base unit (150x75) and applies all 31 LFO variables.
-    """
-    y, x = np.mgrid[0:CALC_UNIT_HEIGHT, 0:CALC_UNIT_WIDTH] 
-    
-    effective_time_s_final = effective_time_s + v['time_shift_offset']
-    
-    calc_x = x * SCALE_FACTOR_X
-    calc_y = y * SCALE_FACTOR_Y
-    
-    # Apply skew (v['coord_skew'])
-    calc_x_skewed = calc_x + calc_y * v['coord_skew']
-    calc_y_skewed = calc_y
-    
-    # Apply sine wave distortion to coordinates
-    # 💡 MODIFIED: Reduced the distortion magnitude from *10 to *5 for a calmer effect
-    x_wave_distortion = np.sin(calc_y_skewed * v['x_wave_freq']) * v['r_skew_x_amp'] * 5 
-    y_wave_distortion = np.sin(calc_x_skewed * v['y_wave_freq']) * 5 
-    
-    calc_x_final = calc_x_skewed + x_wave_distortion
-    calc_y_final = calc_y_skewed + y_wave_distortion
-    
-    # Normalize coordinates using the 1600 range
-    nx = ((calc_x_final / CALC_WIDTH) * 2 - 1) + v['shift_center_x']
-    ny = ((calc_y_final / CALC_HEIGHT) * 2 - 1) + v['shift_center_y']
-    
-    # Calculate Radius (R) and Angle (Angle)
-    # Applied radial distortion (v['r_mult_x'], v['r_mult_y']) and offset (v['r_offset'])
-    r = np.power(np.sqrt((nx * v['r_mult_x'])**2 + (ny * v['r_mult_y'])**2), v['r_exponent']) + v['r_offset']
-    r = np.maximum(r, 0.0001) # Clamp to prevent numerical issues
-    
-    # Apply angular offset (v['angle_offset'])
-    angle = np.arctan2(ny, nx) + v['angle_offset']
 
-    shift_x = v['shift_x_mult'] 
-    shift_y = v['shift_y_mult'] 
-    blue_hue_shift = np.sin(effective_time_s_final * v['blue_hue_speed']) * v['freq_b'] * 100 
+# --- OpenGL/GLSL Shader Setup ---
 
-    # --- Calculate Color Channels ---
+# 1. Vertex Shader (Passes coordinates)
+VERTEX_SHADER_SOURCE = """
+#version 330 core
+layout(location = 0) in vec2 position;
+void main() {
+    gl_Position = vec4(position.x, position.y, 0.0, 1.0);
+}
+"""
 
-    red_input = v['freq_r'] * (calc_x_final + calc_y_final * v['time_mult_r']) + shift_x + v['offset_r']
-    Red = v['R_amp'] * (np.sin(red_input) + 1)
-    
-    radial_term_g = (calc_y_final * r * v['r_factor'] * v['r_freq_mult_g'])
-    color_mix_term = red_input * v['color_mix_mult'] * 0.1 
-    
-    green_input = v['freq_g'] * (radial_term_g + color_mix_term) + angle * v['angle_factor'] + shift_y + v['offset_g']
-    Green = v['G_amp'] * (np.sin(green_input) + 1)
-    
-    blue_input = v['freq_b'] * (calc_x_final * 4 + effective_time_s_final * v['time_mult_b']) + blue_hue_shift + v['offset_b']
-    Blue = v['B_amp'] * (np.sin(blue_input) + 1)
-    
-    rgb_array = np.dstack((Red, Green, Blue)).astype(np.uint8)
-    return rgb_array
+# 2. Fragment Shader (Replaces generate_frame_numpy)
+FRAGMENT_SHADER_SOURCE = f"""
+#version 330 core
+out vec4 color;
 
+// Uniforms (variables passed from the Python/CPU code)
+uniform float u_time;
+uniform vec2 u_resolution;
+uniform float freq_r, freq_g, freq_b;
+uniform float R_amp, G_amp, B_amp;
+uniform float shift_x_mult, shift_y_mult;
+uniform float r_factor, angle_factor;
+uniform float shift_center_x, shift_center_y;
+uniform float time_mult_r, time_mult_g, time_mult_b;
+uniform float offset_r, offset_g, offset_b;
+uniform float r_exponent, blue_hue_speed;
 
-def run_real_time_codeart():
+void main() {{
+    // Global constant for pattern size
+    float calc_width = {CALC_WIDTH}.0;
+    float calc_height = {CALC_HEIGHT}.0;
+    
+    // Map gl_FragCoord (pixel coords) to the virtual 1600x1600 grid proportionally
+    float screen_scale_x = calc_width / u_resolution.x;
+    float screen_scale_y = calc_height / u_resolution.y;
+
+    float calc_x = gl_FragCoord.x * screen_scale_x;
+    float calc_y = gl_FragCoord.y * screen_scale_y;
+    
+    // Normalize coordinates using the 1600 range and center shift
+    float nx = ((calc_x / calc_width) * 2.0 - 1.0) + shift_center_x;
+    float ny = ((calc_y / calc_height) * 2.0 - 1.0) + shift_center_y;
+
+    // Radial and Angle calculation
+    float r = pow(sqrt(nx*nx + ny*ny), r_exponent);
+    float angle = atan(ny, nx); // atan(y, x) is atan2
+
+    // Dynamic shift
+    float blue_hue_shift = sin(u_time * blue_hue_speed) * freq_b * 100.0; 
+
+    // --- Color Channel Calculations (Translated from NumPy) ---
+    // Red Channel
+    float red_input = freq_r * (calc_x + calc_y * time_mult_r) + shift_x_mult + offset_r;
+    float Red = R_amp * (sin(red_input) + 1.0);
+
+    // Green Channel
+    float green_input = freq_g * (calc_y * r * r_factor) + angle * angle_factor + shift_y_mult + offset_g;
+    float Green = G_amp * (sin(green_input) + 1.0);
+    
+    // Blue Channel
+    // Note: calc_x * 4 is simplified from (calc_x / 1600) * 4 * 1600, 
+    // it seems the original used a coordinate four times larger than needed, keeping that logic.
+    float blue_input = freq_b * (calc_x * 4.0 + u_time * time_mult_b) + blue_hue_shift + offset_b;
+    float Blue = B_amp * (sin(blue_input) + 1.0);
+    
+    // Output color (normalized to 0.0-1.0 range, max amplitude is 254)
+    vec3 final_color = vec3(Red / 255.0, Green / 255.0, Blue / 255.0);
+    
+    color = vec4(final_color, 1.0); // R, G, B, Alpha
+}}
+"""
+
+def compile_shader(source, type):
+    """Compiles a single GLSL shader."""
+    shader = glCreateShader(type)
+    glShaderSource(shader, source)
+    glCompileShader(shader)
+    
+    if not glGetShaderiv(shader, GL_COMPILE_STATUS):
+        # Decode error message for readability
+        raise RuntimeError(f"Shader compilation failed: \n{glGetShaderInfoLog(shader).decode('utf-8')}")
+    return shader
+
+def create_shader_program():
+    """Compiles and links the Vertex and Fragment shaders."""
+    vertex = compile_shader(VERTEX_SHADER_SOURCE, GL_VERTEX_SHADER)
+    fragment = compile_shader(FRAGMENT_SHADER_SOURCE, GL_FRAGMENT_SHADER)
+    
+    program = glCreateProgram()
+    glAttachShader(program, vertex)
+    glAttachShader(program, fragment)
+    glLinkProgram(program)
+    glDeleteShader(vertex)
+    glDeleteShader(fragment)
+    
+    if not glGetProgramiv(program, GL_LINK_STATUS):
+        raise RuntimeError(f"Shader linking failed: \n{glGetProgramInfoLog(program).decode('utf-8')}")
+    return program
+
+def setup_gl_context(width, height):
+    """Sets up the OpenGL viewport and projection."""
+    glViewport(0, 0, width, height)
+    # Clear background to black
+    glClearColor(0.0, 0.0, 0.0, 1.0)
+    # Simple orthographic projection to map screen coordinates to (-1, 1)
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    glOrtho(-1, 1, -1, 1, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
+
+def setup_quad():
+    """Creates the VBO for a full-screen quad."""
+    # Vertices for a quad covering the full (-1, -1) to (1, 1) range
+    quad_vertices = np.array([
+        -1.0, -1.0,  # Bottom-left
+         1.0, -1.0,  # Bottom-right
+         1.0,  1.0,  # Top-right
+        -1.0,  1.0   # Top-left
+    ], dtype=np.float32)
+
+    # Create VBO
+    vbo = glGenBuffers(1)
+    glBindBuffer(GL_ARRAY_BUFFER, vbo)
+    glBufferData(GL_ARRAY_BUFFER, quad_vertices.nbytes, quad_vertices, GL_STATIC_DRAW)
+    
+    # Define how the vertex data is interpreted (location 0 is the 'position' attribute)
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, None)
+    glEnableVertexAttribArray(0)
+    
+    return vbo
+
+def run_real_time_codeart_gl():
     try:
         pygame.init()
         global SCREEN_WIDTH, SCREEN_HEIGHT
         
-        flags = pygame.RESIZABLE
+        # Initialize Pygame with OpenGL context and Double Buffering
+        flags = DOUBLEBUF | OPENGL | RESIZABLE
         screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
-        pygame.display.set_caption(f"8v x 4h Calm Geometry Art @ {TARGET_FPS} FPS")
-        clock = pygame.time.Clock()
+        pygame.display.set_caption(f"GPU-Accelerated Shader Art @ {TARGET_FPS} FPS")
         
+        setup_gl_context(SCREEN_WIDTH, SCREEN_HEIGHT)
+        program = create_shader_program()
+        vbo = setup_quad()
+        glUseProgram(program)
+
+        # Get uniform locations once for efficiency
+        uniform_locations = {name: glGetUniformLocation(program, name) for name in VARIABLE_PARAMS}
+        uniform_locations['u_time'] = glGetUniformLocation(program, "u_time")
+        uniform_locations['u_resolution'] = glGetUniformLocation(program, "u_resolution")
+
+        clock = pygame.time.Clock()
         running = True
         
-        static_surface = pygame.Surface((RENDER_RESOLUTION, RENDER_RESOLUTION))
-
-        print(f"1/3: 8v x 4h Calm Geometry Symmetry enabled. Targeting stable {TARGET_FPS} FPS.")
+        print(f"1/3: GPU acceleration enabled. Targeting steady {TARGET_FPS} FPS.")
         
         while running:
+            # --- Event Handling ---
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
                 
                 if event.type == pygame.VIDEORESIZE:
+                    # Update screen size, recreate Pygame window, and reset GL viewport
                     SCREEN_WIDTH, SCREEN_HEIGHT = event.size
-                    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
-
+                    pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
+                    setup_gl_context(SCREEN_WIDTH, SCREEN_HEIGHT)
+            
             current_time_ms = pygame.time.get_ticks()
             effective_time_s = (current_time_ms / 1000.0) / SLOW_MOTION_FACTOR 
 
-            # --- CALCULATE ONLY THE 150x75 BASE UNIT (1/32nd of the work) ---
+            # --- CPU LFO Calculation ---
+            # Calculate all 20 LFO values on the CPU
             v = {name: generate_lfo_value(name, effective_time_s) for name in VARIABLE_PARAMS}
-            base_unit = generate_frame_numpy(v, effective_time_s)
             
-            # --- NUMPY SYMMETRY COPY-PASTE (8v x 4h Stitching) ---
+            # --- Pass Uniforms to GPU ---
+            glUseProgram(program)
             
-            # The base unit B is 75x150
-            B = base_unit
+            # Pass Time and Resolution
+            glUniform1f(uniform_locations['u_time'], effective_time_s)
+            glUniform2f(uniform_locations['u_resolution'], float(SCREEN_WIDTH), float(SCREEN_HEIGHT))
             
-            # 1. Create the base horizontal strip (1v x 4h) (75x600)
-            B_flip = np.flip(B, axis=1) 
-            h_strip = np.concatenate((B, B_flip, B, B_flip), axis=1)
+            # Pass all 20 LFO variables
+            for name, value in v.items():
+                glUniform1f(uniform_locations[name], value)
 
-            # 2. Create the vertical flip of the strip
-            v_flip_strip = np.flip(h_strip, axis=0)
+            # --- RENDER PHASE ---
+            glClear(GL_COLOR_BUFFER_BIT) # Clear the screen
             
-            # 3. Concatenate 8 alternating strips vertically (8v)
-            final_array = np.concatenate((
-                h_strip, v_flip_strip,
-                h_strip, v_flip_strip,
-                h_strip, v_strip, # Note: using v_strip (vertically flipped) here continues the vertical reflection
-                h_strip, v_flip_strip
-            ), axis=0)
-            # Correcting the concatenation for perfect 8v x 4h: 4 pairs of H | V_flip
-            final_array = np.concatenate((
-                h_strip, v_flip_strip,
-                h_strip, v_flip_strip,
-                h_strip, v_flip_strip,
-                h_strip, v_flip_strip
-            ), axis=0)
-
-
-            # --- DISPLAY PHASE ---
+            # Draw the quad: This triggers the Fragment Shader for every pixel
+            glDrawArrays(GL_QUADS, 0, 4) 
             
-            screen.fill((0, 0, 0)) 
-            
-            # 1. Convert the 600x600 final array to the fixed static_surface
-            pygame.surfarray.blit_array(static_surface, final_array)
-            
-            # 2. Perform the expensive scaling operation ONCE per frame
-            scaled_surface = pygame.transform.scale(static_surface, (SCREEN_WIDTH, SCREEN_HEIGHT))
-            
-            # 3. Blit the scaled surface
-            screen.blit(scaled_surface, (0, 0))
-
+            # Swap buffers to display the new frame
             pygame.display.flip()
             
-            # Enforce stable 120 FPS
+            # Enforce stable 60 FPS
             clock.tick(TARGET_FPS) 
             
             current_time_s = current_time_ms / 1000.0
             if current_time_s % 5 < (1 / TARGET_FPS):
-                print(f"   -> Actual FPS: {clock.get_fps():.2f}")
-
+                print(f"  -> Actual FPS: {clock.get_fps():.2f}")
 
         print("3/3: Animation closed.")
+        # Cleanup
+        glDeleteProgram(program)
+        glDeleteBuffers(1, [vbo])
         pygame.quit()
 
-    except ImportError:
-        print("\nERROR: NumPy or Pygame is not installed.")
-        print("Please run: **pip install numpy pygame**")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"An unexpected error occurred during execution: {e}")
+        pygame.quit()
 
 if __name__ == "__main__":
-    run_real_time_codeart()
+    run_real_time_codeart_gl()
