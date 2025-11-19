@@ -11,39 +11,44 @@ except ImportError:
     print("\nERROR: PyOpenGL is not installed. Please run: pip install PyOpenGL PyOpenGL_accelerate")
     exit()
 
-# --- Configuration ---
-CALC_RESOLUTION = 80
+# --- Configuration (Unchanged) ---
+CALC_RESOLUTION = 400
 TARGET_FPS = 120
 SLOW_MOTION_FACTOR = 250.0
-LFO_TURBO_FACTOR = 5.0  # New factor for Right Click turbo mode
-SCREEN_WIDTH, SCREEN_HEIGHT = 800, 600
+
+SCREEN_WIDTH, SCREEN_HEIGHT = 1200, 900 
 CALC_WIDTH = 1600 
 CALC_HEIGHT = 1600
 
-# Global state flags for interaction
-g_lfo_turbo_on = False
-# Initialize feedback_mix to a value within its normal LFO range
-g_feedback_level = 0.9 
+# Physics Constants (Unchanged)
+DAMPING_FACTOR = 0.93        
+MOUSE_FORCE_SCALE = 0.0005   
 
-# 💡 20 VARIABLES AND THEIR RANGES
+# Global state flags (Unchanged)
+g_is_rclick_held = False      
+g_center_velocity_x = 0.0     
+g_center_velocity_y = 0.0     
+g_last_mouse_pos = (0, 0)     
+g_lfo_turbo_on = False        
+g_feedback_level = 0.9        
+
+# 💡 20 VARIABLES AND THEIR RANGES (Unchanged)
 VARIABLE_PARAMS = {
     'freq_r': (0.02, 0.005, 0.05), 'freq_g': (0.015, 0.005, 0.05),
     'freq_b': (0.025, 0.01, 0.08), 'R_amp': (127.0, 60.0, 127.0),
     'G_amp': (127.0, 60.0, 127.0), 'B_amp': (127.0, 60.0, 127.0),
     'shift_x_mult': (5.0, -100.0, 100.0), 'shift_y_mult': (2.0, -100.0, 100.0), 
-    'r_factor': (10.0, 5.0, 25.0), 'angle_factor': (3.0, 1.0, 8.0),
-    'shift_center_x': (0.0, -0.2, 0.2), 'shift_center_y': (0.0, -0.2, 0.2),
+    'r_factor': (10.0, 5.0, 25.0), 'angle_factor': (3.0, 1.0, 8.0), 
+    'shift_center_x': (0.0, -0.2, 0.2), 'shift_center_y': (0.0, -0.2, 0.2), 
     'time_mult_r': (1.0, 0.5, 2.0), 'time_mult_g': (1.0, 0.5, 2.0),
     'time_mult_b': (1.0, 0.5, 2.0), 'offset_r': (0.0, -10.0, 10.0),
     'offset_g': (0.0, -10.0, 10.0), 'offset_b': (0.0, -10.0, 10.0),
     'r_exponent': (1.0, 0.5, 2.0), 'blue_hue_speed': (2.0, 0.5, 4.0),
-    # Feedback mix range is 0.7 to 0.995
     'feedback_mix': (0.9, 0.7, 0.995) 
 }
-# Set initial global feedback level based on LFO base value
 g_feedback_level = VARIABLE_PARAMS['feedback_mix'][0]
 
-# LFO Frequencies (Global)
+# LFO Frequencies (Unchanged)
 def generate_lfo_frequencies(params):
     frequencies = {}
     for name in params:
@@ -61,9 +66,8 @@ def generate_lfo_value(variable_name, effective_time_s):
     base, min_val, max_val = VARIABLE_PARAMS[variable_name]
     lfo_freq = LFO_FREQUENCIES[variable_name]
     
-    # Apply global turbo factor if active
     if g_lfo_turbo_on:
-        lfo_freq *= LFO_TURBO_FACTOR
+        lfo_freq *= 5.0
 
     lfo_output = np.sin(effective_time_s * lfo_freq * 2 * np.pi)
     normalized_lfo = (lfo_output + 1.0) / 2.0
@@ -108,6 +112,9 @@ class FBO_Renderer:
         if hasattr(self, 'fbos'):
             glDeleteFramebuffers(2, self.fbos)
             glDeleteTextures(2, self.textures)
+    
+    def __del__(self):
+        self.cleanup()
 
 
 # --- GLSL Shader Source ---
@@ -128,7 +135,6 @@ uniform float u_time;
 uniform vec2 u_resolution;
 uniform vec2 u_mouse; 
 uniform float u_reset_mix;
-uniform float u_lfo_turbo_on; // NEW: Not used in shader, but useful for Python LFO rate calc
 
 // LFO Uniforms
 uniform float freq_r, freq_g, freq_b;
@@ -139,7 +145,7 @@ uniform float shift_center_x, shift_center_y;
 uniform float time_mult_r, time_mult_g, time_mult_b;
 uniform float offset_r, offset_g, offset_b;
 uniform float r_exponent, blue_hue_speed;
-uniform float feedback_mix; // Now controlled by Mouse Wheel!
+uniform float feedback_mix;
 uniform sampler2D u_prev_frame; 
 
 
@@ -147,32 +153,88 @@ void main() {{
     float calc_width = {CALC_WIDTH}.0;
     float calc_height = {CALC_HEIGHT}.0;
     
-    float screen_scale_x = calc_width / u_resolution.x;
-    float screen_scale_y = calc_height / u_resolution.y;
-
-    float calc_x = gl_FragCoord.x * screen_scale_x;
-    float calc_y = gl_FragCoord.y * screen_scale_y;
+    // --- 1. SPHERE PROJECTION SETUP ---
+    // Normalized screen coordinates, centered, aspect ratio corrected (from -1 to 1)
+    vec2 uv = gl_FragCoord.xy / u_resolution.xy;
+    vec2 pos = uv * 2.0 - 1.0; 
+    pos.x *= u_resolution.x / u_resolution.y; // Aspect correction
     
-    // --- Mouse Interaction ---
-    vec2 normalized_mouse = u_mouse / u_resolution.xy * 2.0 - 1.0; 
+    // Define sphere radius and center
+    float sphere_radius = 0.8; 
+    vec3 sphere_center = vec3(0.0, 0.0, 0.0);
     
-    float final_shift_x = shift_center_x + normalized_mouse.x * 0.15;
-    float final_shift_y = shift_center_y - normalized_mouse.y * 0.15;
+    // Simple 2D distance to the center of the sphere
+    float dist = length(pos);
 
-    float nx = ((calc_x / calc_width) * 2.0 - 1.0) + final_shift_x;
-    float ny = ((calc_y / calc_height) * 2.0 - 1.0) + final_shift_y;
+    if (dist > sphere_radius) {{
+        // Outside the sphere, return black (or previous frame to preserve trails)
+        // return vec4(0.0, 0.0, 0.0, 1.0); 
+        vec2 uv_prev = gl_FragCoord.xy / u_resolution.xy; 
+        vec3 prev_color = texture(u_prev_frame, uv_prev).rgb;
+        color = vec4(prev_color * 0.9, 1.0); // Fade the edges
+        return;
+    }}
 
-    // Radial and Angle calculation
-    float r = pow(sqrt(nx*nx + ny*ny), r_exponent);
+    // --- 2. MAP TO SPHERE SURFACE ---
+    // Z coordinate using the Pythagorean theorem (z^2 = r^2 - x^2 - y^2)
+    float z = sqrt(sphere_radius * sphere_radius - dot(pos, pos)); 
+    vec3 sphere_coords = vec3(pos.x, pos.y, z);
+
+    // Rotation (Simple yaw/pitch/roll simulation)
+    // Use physics shift (shift_center_x) for constant rotation for visual interest
+    float rotation_x = u_time * 0.1;
+    float rotation_y = shift_center_x * 1.5; // Use physics input for rotation influence
+
+    // Rotation Matrices (Simplified)
+    float cosX = cos(rotation_x);
+    float sinX = sin(rotation_x);
+    float cosY = cos(rotation_y);
+    float sinY = sin(rotation_y);
+
+    // Apply X rotation (Pitch)
+    float temp_y = sphere_coords.y * cosX - sphere_coords.z * sinX;
+    float temp_z = sphere_coords.y * sinX + sphere_coords.z * cosX;
+    sphere_coords.y = temp_y;
+    sphere_coords.z = temp_z;
+
+    // Apply Y rotation (Yaw)
+    float temp_x = sphere_coords.x * cosY + sphere_coords.z * sinY;
+    temp_z = -sphere_coords.x * sinY + sphere_coords.z * cosY;
+    sphere_coords.x = temp_x;
+    sphere_coords.z = temp_z;
+    
+    // --- 3. CONVERT TO POLAR FOR PATTERN ---
+    // Map Cartesian (x, y, z) to Polar (latitude, longitude)
+    // Longitude (horizontal pattern coordinate)
+    float texture_u = atan(sphere_coords.x, sphere_coords.z) / (2.0 * 3.14159265);
+    // Latitude (vertical pattern coordinate)
+    float texture_v = asin(sphere_coords.y / sphere_radius) / 3.14159265; 
+    
+    // Scale and center the coordinates to match the original 1600x1600 logic
+    // The texture_u (longitude) runs from -0.5 to 0.5. We scale it up.
+    float calc_x = (texture_u + 0.5) * calc_width; // Map 0 to 1 range, then scale
+    float calc_y = (texture_v + 0.5) * calc_height;
+    
+    // New normalized coordinates based on sphere's polar space
+    float nx = (texture_u * 2.0); // -1.0 to 1.0
+    float ny = (texture_v * 2.0); // -1.0 to 1.0
+
+    // --- 4. APPLY LFO SHIFTS AND PATTERN LOGIC ---
+    // Apply LFO/Mouse shift/Physics shift (still useful for wobbling the texture)
+    nx += shift_center_x;
+    ny += shift_center_y;
+
+    float r_new = pow(sqrt(nx*nx + ny*ny), r_exponent);
     float angle = atan(ny, nx); 
 
     float blue_hue_shift = sin(u_time * blue_hue_speed) * freq_b * 100.0; 
 
     // --- Color Channel Calculations ---
+    // R-Click (angle_factor) is still used for the texture's inner spin when held
     float red_input = freq_r * (calc_x + calc_y * time_mult_r) + shift_x_mult + offset_r;
     float Red = R_amp * (sin(red_input) + 1.0);
     
-    float green_input = freq_g * (calc_y * r * r_factor) + angle * angle_factor + shift_y_mult + offset_g;
+    float green_input = freq_g * (calc_y * r_new * r_factor) + angle * angle_factor + shift_y_mult + offset_g;
     float Green = G_amp * (sin(green_input) + 1.0);
     
     float blue_input = freq_b * (calc_x * 4.0 + u_time * time_mult_b) + blue_hue_shift + offset_b;
@@ -181,20 +243,19 @@ void main() {{
     vec3 new_color = vec3(Red / 255.0, Green / 255.0, Blue / 255.0);
 
     // --- Feedback and Reset ---
-    vec2 uv = gl_FragCoord.xy / u_resolution.xy; 
-    vec3 prev_color = texture(u_prev_frame, uv).rgb;
+    vec2 uv_feedback = gl_FragCoord.xy / u_resolution.xy; 
+    vec3 prev_color = texture(u_prev_frame, uv_feedback).rgb;
     
-    // feedback_mix is now directly set by the mouse wheel control
     vec3 mixed_color = mix(new_color, prev_color, feedback_mix);
     
-    // If u_reset_mix is 0.0 (Left Click), the feedback is hard-reset.
+    // Left Click reset logic
     vec3 final_color = mix(new_color, mixed_color, u_reset_mix);
     
     color = vec4(final_color, 1.0);
 }}
 """
 
-# --- OpenGL Boilerplate Functions (Unchanged) ---
+# --- OpenGL Boilerplate Functions (Mostly Unchanged) ---
 def compile_shader(source, type):
     shader = glCreateShader(type)
     glShaderSource(shader, source)
@@ -243,7 +304,8 @@ def setup_quad():
 # --- Main Application Loop ---
 
 def run_real_time_codeart_gl():
-    global LFO_FREQUENCIES, g_lfo_turbo_on, g_feedback_level
+    global LFO_FREQUENCIES, g_lfo_turbo_on, g_feedback_level, g_is_rclick_held
+    global g_center_velocity_x, g_center_velocity_y, g_last_mouse_pos
     
     try:
         pygame.init()
@@ -251,7 +313,7 @@ def run_real_time_codeart_gl():
         
         flags = DOUBLEBUF | OPENGL | RESIZABLE
         screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
-        pygame.display.set_caption(f"Shader Art (Direct LFO/Feedback Control) @ {TARGET_FPS} FPS")
+        pygame.display.set_caption(f"Shader Art (3D Sphere Projection) @ {TARGET_FPS} FPS")
         
         setup_gl_context(SCREEN_WIDTH, SCREEN_HEIGHT)
         program = create_shader_program()
@@ -272,17 +334,20 @@ def run_real_time_codeart_gl():
         clock = pygame.time.Clock()
         running = True
         
-        mouse_x, mouse_y = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
         reset_mix_val = 1.0 
+        g_last_mouse_pos = pygame.mouse.get_pos()
         
-        print(f"1/3: Interactive GPU Shader running @ {TARGET_FPS} FPS.")
+        print(f"1/3: 3D Sphere Projection enabled. Resolution: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
         print("2/3: Controls:")
         print("    - Left Click: Instant Visual Reset & Parameter Flip.")
-        print("    - Right Click: LFO Turbo Mode Toggle (5x Speed).")
-        print("    - Middle Click: Shuffle LFO Frequencies (New Motion).")
+        print("    - Right Click (HOLD): Continuous Reorientation (Pattern Spin).")
+        print("    - Middle Click: Shuffle LFO Frequencies (New Motion Pattern).")
         print("    - Mouse Wheel: Controls Feedback/Trail Length.")
+        print("    - Mouse Movement: Imparts momentum to the sphere's texture (Physics).")
         
         while running:
+            delta_time = clock.get_time() / 1000.0 
+
             # --- Event Handling ---
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -292,8 +357,7 @@ def run_real_time_codeart_gl():
                     SCREEN_WIDTH, SCREEN_HEIGHT = event.size
                     pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
                     setup_gl_context(SCREEN_WIDTH, SCREEN_HEIGHT)
-                    fbo_manager.cleanup()
-                    fbo_manager = FBO_Renderer(SCREEN_WIDTH, SCREEN_HEIGHT)
+                    fbo_manager = FBO_Renderer(SCREEN_WIDTH, SCREEN_HEIGHT) 
                 
                 if event.type == pygame.MOUSEBUTTONDOWN:
                     min_fb, max_fb = VARIABLE_PARAMS['feedback_mix'][1], VARIABLE_PARAMS['feedback_mix'][2]
@@ -303,35 +367,65 @@ def run_real_time_codeart_gl():
                         LFO_FREQUENCIES = generate_lfo_frequencies(VARIABLE_PARAMS)
                         print("    -> Left Click: Reset and Parameters Flipped.")
                         
-                    elif event.button == 3: # Right Click: LFO Turbo Toggle
-                        g_lfo_turbo_on = not g_lfo_turbo_on
-                        print(f"    -> Right Click: LFO Turbo Mode {'ON' if g_lfo_turbo_on else 'OFF'}.")
-                    
+                    elif event.button == 3: # Right Click: START Reorientation
+                        g_is_rclick_held = True
+                        print("    -> Right Click: Reorientation active (Spinning).")
+                        
                     elif event.button == 2: # Middle Click: Shuffle LFO Frequencies
                         LFO_FREQUENCIES = generate_lfo_frequencies(VARIABLE_PARAMS)
                         print("    -> Middle Click: Movement Shuffled.")
                         
                     elif event.button == 4: # Mouse Wheel Up: Increase Feedback
-                        # Scroll up increases trail length (up to max_fb)
                         g_feedback_level = min(max_fb, g_feedback_level + 0.005)
                         
                     elif event.button == 5: # Mouse Wheel Down: Decrease Feedback
-                        # Scroll down decreases trail length (down to min_fb)
                         g_feedback_level = max(min_fb, g_feedback_level - 0.005)
+                
+                if event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 3: # Right Click: STOP Reorientation
+                        g_is_rclick_held = False
+                        print("    -> Right Click: Reorientation stopped.")
 
             
-            # Continuous Mouse Position Update
-            mouse_x, mouse_y = pygame.mouse.get_pos()
+            # --- Continuous Physics Update (Mouse & Momentum) ---
+            current_mouse_x, current_mouse_y = pygame.mouse.get_pos()
             
+            mouse_delta_x = current_mouse_x - g_last_mouse_pos[0]
+            mouse_delta_y = current_mouse_y - g_last_mouse_pos[1]
+
+            # Apply force to velocity based on mouse delta
+            g_center_velocity_x += mouse_delta_x * MOUSE_FORCE_SCALE
+            g_center_velocity_y += mouse_delta_y * MOUSE_FORCE_SCALE
+
+            # Apply damping (friction)
+            g_center_velocity_x *= DAMPING_FACTOR
+            g_center_velocity_y *= DAMPING_FACTOR
+
+            g_last_mouse_pos = (current_mouse_x, current_mouse_y)
+
             current_time_ms = pygame.time.get_ticks()
             effective_time_s = (current_time_ms / 1000.0) / SLOW_MOTION_FACTOR 
 
-            # --- CPU LFO Calculation ---
+            # --- CPU LFO Calculation & Overrides ---
             v = {name: generate_lfo_value(name, effective_time_s) for name in VARIABLE_PARAMS}
             
-            # Override feedback_mix LFO with manual mouse wheel control
-            v['feedback_mix'] = g_feedback_level
+            # 1. Feedback Override
+            v['feedback_mix'] = g_feedback_level 
             
+            # 2. Physics Override (Momentum applied to center shift)
+            # This shift now controls the sphere's position/wobble and internal texture shift
+            v['shift_center_x'] += g_center_velocity_x
+            v['shift_center_y'] += g_center_velocity_y
+            
+            # 3. R-Click Override (Continuous Reorientation)
+            if g_is_rclick_held:
+                # Force a high, constant rotation speed for the pattern's angle factor
+                v['angle_factor'] = (math.sin(effective_time_s * 1.5) + 1.0) * 7.5 + 5.0 
+            else:
+                 # When not held, revert to the LFO value for angle_factor
+                 v['angle_factor'] = generate_lfo_value('angle_factor', effective_time_s)
+
+
             # --- 1. Render into FBO (Off-screen render) ---
             fbo_manager.bind_next_fbo()
             glViewport(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
@@ -340,21 +434,21 @@ def run_real_time_codeart_gl():
             glUseProgram(program)
             glUniform1f(uniform_locations['u_time'], effective_time_s)
             glUniform2f(uniform_locations['u_resolution'], float(SCREEN_WIDTH), float(SCREEN_HEIGHT))
-            glUniform2f(uniform_locations['u_mouse'], float(mouse_x), float(mouse_y))
+            glUniform2f(uniform_locations['u_mouse'], float(current_mouse_x), float(current_mouse_y))
             glUniform1f(uniform_locations['u_reset_mix'], reset_mix_val)
 
-            # Pass LFO variables (including the now-manual feedback_mix)
+            # Pass LFO and Physics-modified variables
             for name, value in v.items():
                 glUniform1f(uniform_locations[name], value)
             
-            # Bind the texture from the *previous* frame for the shader to read
+            # Bind the texture from the *previous* frame
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_2D, fbo_manager.get_input_texture())
 
             # Draw the quad to update the FBO texture
             glDrawArrays(GL_QUADS, 0, 4) 
             
-            # Reset the hard-reset flag immediately after one frame
+            # Reset the hard-reset flag
             reset_mix_val = 1.0
             
             # --- 2. Render FBO Texture to Screen (Final display) ---
@@ -376,7 +470,6 @@ def run_real_time_codeart_gl():
         # Cleanup
         glDeleteProgram(program)
         glDeleteBuffers(1, [vbo])
-        fbo_manager.cleanup()
         pygame.quit()
 
     except Exception as e:
